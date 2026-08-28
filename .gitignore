@@ -1,0 +1,8 @@
+logs/
+*.log
+.glm53-*.inner.sh
+*.2node
+*.tp3bak
+__pycache__/
+*.pyc
+.DS_Store

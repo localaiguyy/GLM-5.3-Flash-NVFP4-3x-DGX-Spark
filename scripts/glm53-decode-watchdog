@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# glm53-decode-watchdog -- detect a WEDGED GLM-5.3-Flash TP=3 cluster and
+# capture the evidence that a restart would destroy.
+#
+# Ported from the DSv4 TP=3 watchdog; the probe/threshold/capture discipline
+# is identical, the Ray-cluster specifics differ (per-rank container NAMES
+# differ here, and the engine worker is a Ray worker process).
+#
+# WHAT IT DOES
+# ------------
+# Probes the endpoint with a real completion on a timer. If the cluster stops
+# decoding, it captures per-rank diagnostic state and alerts, without
+# restarting.
+#
+# ⛔ A 200 on /v1/models does NOT mean the cluster can decode. The API server
+# answers that endpoint from LOCAL state even after every worker is gone. The
+# only reliable liveness test is a real completion returning real tokens.
+#
+# ⛔ NO `|| true` ANYWHERE. A safeguard that swallows its own errors cannot
+# report its own death. Every failure path here exits non-zero and says why.
+#
+# Two consecutive failures are required before it alarms, so a slow prefill
+# or a giant multimodal prompt does not trip it. On a confirmed wedge it
+# captures py-spy stacks from every rank plus the GPU counters BEFORE
+# alerting, and leaves the cluster running -- the live process holds the only
+# copy of that state.
+#
+# Usage:  glm53-decode-watchdog
+# Config: env vars below. Intended to run from a systemd timer every ~5 min.
+
+set -euo pipefail
+
+MODEL="${GLM53_MODEL:?set GLM53_MODEL to the served model name}"
+ENDPOINT="${GLM53_ENDPOINT:-http://localhost:8888/v1/chat/completions}"
+# Space-separated addresses of ALL ranks, rank 0 (the head) first.
+# ⛔ Use IPs/hostnames that resolve ON THIS HOST, not SSH-config aliases from
+# your laptop.
+RANKS="${GLM53_RANKS:?set GLM53_RANKS to all rank addresses, rank 0 first}"
+# Space-separated container names, SAME ORDER as RANKS. Unlike the DSv4
+# stack (one compose service name everywhere), this recipe names each node's
+# container differently.
+CONTAINERS="${GLM53_CONTAINERS:-glm53-flash-head glm53-flash-worker1 glm53-flash-worker2}"
+# The address of THIS host within RANKS (its capture runs locally, not SSH).
+SELF_IP="${GLM53_SELF_IP:-}"
+SSH_USER="${GLM53_SSH_USER:-$(id -un)}"
+TIMEOUT="${GLM53_TIMEOUT:-60}"
+STATE_DIR="${GLM53_STATE_DIR:-/var/lib/glm53-watchdog}"
+# Process pattern for the engine worker inside the container. Under the Ray
+# executor the per-rank engine is a Ray worker process, not vLLM's Worker_TP.
+PROC_PAT="${GLM53_PROC_PAT:-RayWorker|Worker_TP|EngineCore}"
+EVIDENCE_DIR="$STATE_DIR/evidence"
+
+mkdir -p "$STATE_DIR"
+# The capture redirects below write as THIS user while the commands inside run
+# via sudo (SC2024 — intentional). That only works if this user owns STATE_DIR,
+# so make the contract loud at startup instead of failing mid-capture:
+[ -w "$STATE_DIR" ] || { echo "FATAL: $STATE_DIR not writable by $(id -un) — fix ownership or run the unit as root" >&2; exit 1; }
+
+log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+
+# Run a command on a rank: locally if it is this host, over SSH otherwise.
+on_rank() {
+  local host="$1"; shift
+  if [[ -n "$SELF_IP" && "$host" == "$SELF_IP" ]]; then
+    bash -c "$*"
+  else
+    sudo -n -u "$SSH_USER" ssh -o ConnectTimeout=15 -o BatchMode=yes "$host" "$*"
+  fi
+}
+
+ctr_for() {  # container name for rank index $1
+  # shellcheck disable=SC2086
+  set -- $CONTAINERS; shift "$1" 2>/dev/null || { echo ""; return; }
+  echo "${1:-}"
+}
+
+probe() {
+  # Thinking off asks the template to skip the reasoning channel. Some GLM
+  # profiles still emit a short reasoning-style prelude in content, so leave
+  # enough budget to reach visible answer tokens; any non-empty completion is
+  # sufficient for this liveness probe.
+  curl -s -m "$TIMEOUT" "$ENDPOINT" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"$MODEL\",
+         \"messages\":[{\"role\":\"user\",\"content\":\"Reply with only the word OK\"}],
+         \"max_tokens\":32,\"temperature\":0,
+         \"chat_template_kwargs\":{\"enable_thinking\":false}}"
+}
+
+extract_content() {
+  python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    m = d["choices"][0]["message"]
+    c = (m.get("content") or m.get("reasoning_content") or "").strip()
+    if not c:
+        sys.exit(1)
+    print(c)
+except Exception:
+    sys.exit(1)
+'
+}
+
+# A single timeout is not proof of a wedge -- require TWO consecutive
+# failures, so this reports the condition it claims to measure.
+CONSEC_FILE="$STATE_DIR/consecutive_failures"
+[[ -f "$CONSEC_FILE" ]] || echo 0 > "$CONSEC_FILE"
+fails=$(cat "$CONSEC_FILE")
+
+if raw=$(probe) && content=$(printf '%s' "$raw" | extract_content); then
+  if [[ "$fails" -gt 0 ]]; then
+    log "RECOVERED after $fails consecutive failure(s) -- decode returned: '$content'"
+  fi
+  echo 0 > "$CONSEC_FILE"
+  log "OK -- cluster decoded: '$content'"
+  exit 0
+fi
+
+fails=$((fails + 1))
+echo "$fails" > "$CONSEC_FILE"
+log "PROBE FAILED ($fails consecutive) -- no usable completion returned"
+
+if [[ "$fails" -lt 2 ]]; then
+  log "one failure is not proof of a wedge; waiting for the next run to confirm"
+  exit 0
+fi
+
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+OUT="$EVIDENCE_DIR/$STAMP"
+mkdir -p "$OUT"
+log "CONFIRMED WEDGE -- capturing evidence to $OUT before alerting"
+
+# ⚠️ The failure counter is incremented OUTSIDE any redirected group: a
+# `{ ...; n=$((n+1)); } >> file` group runs in a subshell and the increment
+# would be silently lost.
+CAPTURE_FAILURES=0
+
+# The GPU signature that separates a SPIN from real compute: high utilisation
+# with ~idle power and zero memory utilisation.
+for h in $RANKS; do
+  echo "=== $h nvidia-smi ===" >> "$OUT/gpu.txt"
+  if on_rank "$h" 'sudo -n nvidia-smi --query-gpu=utilization.gpu,utilization.memory,power.draw,temperature.gpu --format=csv,noheader' \
+      >> "$OUT/gpu.txt" 2>&1; then
+    :
+  else
+    echo "(nvidia-smi FAILED on $h)" >> "$OUT/gpu.txt"
+    CAPTURE_FAILURES=$((CAPTURE_FAILURES + 1))
+  fi
+done
+
+# py-spy stacks from EVERY rank. Dumping one rank is not fault localisation
+# -- compare stacks, never counters. Under a jammed device queue, each host
+# thread freezes at whatever kernel launch it issues NEXT, so the kernels
+# named in a single rank's stack are the jam's VICTIMS, not its cause.
+idx=0
+for h in $RANKS; do
+  ctr="$(ctr_for "$idx")"; idx=$((idx + 1))
+  echo "=== $h ($ctr) py-spy ===" >> "$OUT/stacks.txt"
+  if [[ -z "$ctr" ]]; then
+    echo "(no container name configured for this rank)" >> "$OUT/stacks.txt"
+    CAPTURE_FAILURES=$((CAPTURE_FAILURES + 1))
+    continue
+  fi
+  if on_rank "$h" "
+      sudo -n docker exec $ctr pip install --quiet py-spy 2>/dev/null
+      P=\$(sudo -n docker exec $ctr ps -eo pid,args --no-headers | grep -iE '$PROC_PAT' | grep -v grep | awk '{print \$1}' | head -1)
+      if [ -z \"\$P\" ]; then echo '(no engine worker process found)'; exit 1; fi
+      for i in 1 2 3; do
+        echo \"--- sample \$i (pid \$P) ---\"
+        sudo -n docker exec --privileged $ctr py-spy dump --pid \$P 2>&1
+        sleep 4
+      done
+    " >> "$OUT/stacks.txt" 2>&1; then
+    :
+  else
+    echo "(py-spy dump FAILED on $h)" >> "$OUT/stacks.txt"
+    CAPTURE_FAILURES=$((CAPTURE_FAILURES + 1))
+  fi
+done
+
+# Scope with --since: a previous run's "Exited (1)" sits in `docker logs`
+# indefinitely and reads as current.
+head_ctr="$(ctr_for 0)"
+# shellcheck disable=SC2024  # redirect intentionally writes as the unit user; see the STATE_DIR contract above
+if ! sudo -n docker logs "$head_ctr" --since 30m > "$OUT/head-log.txt" 2>&1; then
+  log "WARNING: could not capture head container log"
+  CAPTURE_FAILURES=$((CAPTURE_FAILURES + 1))
+fi
+
+# ⛔ A FILE COUNT IS NOT PROOF OF CAPTURE. Report the failures.
+if [[ "$CAPTURE_FAILURES" -gt 0 ]]; then
+  CAPTURE_NOTE="⚠️ $CAPTURE_FAILURES capture step(s) FAILED -- the evidence is INCOMPLETE.
+   Check reachability from this host as user $SSH_USER before trusting these files."
+  log "WARNING: $CAPTURE_FAILURES capture step(s) failed -- evidence incomplete"
+else
+  CAPTURE_NOTE="All capture steps succeeded."
+  log "evidence captured cleanly from all ranks"
+fi
+
+MSG="GLM-5.3-Flash TP=3 is WEDGED (no decode on 2 consecutive probes).
+Evidence captured: $OUT
+  - stacks.txt : py-spy from all ranks, 3 samples each
+  - gpu.txt    : spin signature (high util + low power + 0% mem util)
+  - head-log.txt
+
+$CAPTURE_NOTE
+
+The cluster was left running so the captured state stays reproducible on the
+live process. See docs/TROUBLESHOOTING.md before recovering."
+
+if [[ -n "${GLM53_ALERT_CMD:-}" ]]; then
+  "$GLM53_ALERT_CMD" "$MSG"
+else
+  echo "$MSG"
+fi
+
+# Exit non-zero so systemd records the failure and OnFailure alerting fires.
+exit 1
