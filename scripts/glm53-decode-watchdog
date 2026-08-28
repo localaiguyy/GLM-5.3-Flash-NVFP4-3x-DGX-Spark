@@ -69,8 +69,13 @@ on_rank() {
 }
 
 ctr_for() {  # container name for rank index $1
+  # Capture the index FIRST: `set -- $CONTAINERS` overwrites the positional
+  # parameters, so a later `shift "$1"` would shift by the first CONTAINER NAME
+  # rather than the rank index -- which always fails, returns "", and made every
+  # `docker logs ""` capture step fail silently on every run.
+  local idx="$1"
   # shellcheck disable=SC2086
-  set -- $CONTAINERS; shift "$1" 2>/dev/null || { echo ""; return; }
+  set -- $CONTAINERS; shift "$idx" 2>/dev/null || { echo ""; return; }
   echo "${1:-}"
 }
 

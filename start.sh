@@ -70,6 +70,11 @@ set -euo pipefail
 #   ENV_FILE=my.env ./start.sh
 # Everything in the file is exported; every default below still applies for
 # anything the file leaves unset.
+# Default to ./.env when present: without this, a bare `./start.sh stop` silently
+# falls back to the PLACEHOLDER worker identities below and reports success while
+# the real workers keep running.
+: "${ENV_FILE:=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)/.env}"
+[ -f "$ENV_FILE" ] || ENV_FILE=""
 if [ -n "${ENV_FILE:-}" ]; then
     [ -f "$ENV_FILE" ] || { echo "[glm53-tp3] ENV_FILE=$ENV_FILE not found" >&2; exit 1; }
     set -a
@@ -113,7 +118,14 @@ WORKER2_CX7_IB="${WORKER2_CX7_IB:-rocep1s0f0}"
 HEAD_CX7_IF="${HEAD_CX7_IF:-enp1s0f1np1}"
 HEAD_CX7_IB="${HEAD_CX7_IB:-rocep1s0f1}"
 NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
-NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:-3}"
+# -1 lets NCCL auto-select the RoCEv2 GID per node. Do NOT hardcode an index:
+# the v2/IPv4 GID is NOT guaranteed to land on the same index on every node,
+# even across identical hardware (observed: two nodes at 3, one at 4). Because
+# this knob is global, any fixed value can point some node at a RoCEv1 GID,
+# which fails deep inside ncclCommInitRank as an opaque
+# "NCCL error: unhandled system error" AFTER the full ring has been built.
+# Verify per node with `show_gids` before overriding.
+NCCL_IB_GID_INDEX="${NCCL_IB_GID_INDEX:--1}"
 NCCL_CROSS_NIC="${NCCL_CROSS_NIC:-0}"
 NCCL_HOST_DIR="${NCCL_HOST_DIR:-$HOME/nccl-2.30.7}"
 NCCL_SO_NAME="${NCCL_SO_NAME:-libnccl.so.2.30.7}"
